@@ -1,0 +1,252 @@
+import { describe, it, beforeAll, afterEach, expect, vi } from 'vitest'
+import path from 'node:path'
+import logger from '@wdio/logger'
+
+import { waitForExist } from '../src/commands/element/waitForExist.js'
+import refetchElement from '../src/utils/refetchElement.js'
+import { StrictSelectorError } from '../src/utils/strictSelectorError.js'
+import { remote } from '../src/index.js'
+
+vi.mock('fetch')
+vi.mock('@wdio/logger', () => import(path.join(process.cwd(), '__mocks__', '@wdio/logger')))
+/**
+ * Delegate to the real implementation by default so the other specs keep
+ * exercising the actual refetch path; individual tests can override it once.
+ */
+vi.mock('../src/utils/refetchElement.js', async (importOriginal) => {
+    const actual = (await importOriginal()) as { default: typeof refetchElement }
+    return { __esModule: true, default: vi.fn(actual.default) }
+})
+vi.mock('../src/commands/element/waitUntil', () => ({
+    __esModule: true,
+    waitUntil: vi.fn().mockImplementation(() => { return true })
+}))
+vi.mock('../src/commands/element/waitForDisplayed', () => ({
+    __esModule: true,
+    waitForDisplayed: vi.fn().mockImplementation(() => { return true })
+}))
+vi.mock('../src/commands/element/waitForExist', () => ({
+    __esModule: true,
+    waitForExist: vi.fn().mockImplementation(() => { return true })
+}))
+vi.mock('../src/commands/element/waitForEnabled', () => ({
+    __esModule: true,
+    waitForEnabled: vi.fn().mockImplementation(() => { return true })
+}))
+
+const { warn } = logger('foobar')
+
+describe('middleware', () => {
+    let browser: WebdriverIO.Browser
+
+    beforeAll(async () => {
+        browser = await remote({
+            baseUrl: 'http://foobar.com',
+            capabilities: {
+                browserName: 'foobar'
+            },
+            waitforInterval: 20,
+            waitforTimeout: 100
+        })
+    })
+
+    afterEach(() => {
+        vi.mocked(warn).mockClear()
+        vi.mocked(waitForExist).mockClear()
+    })
+
+    it('should throw an error if the element is never found', async () => {
+        vi.mocked(waitForExist).mockImplementationOnce(() => {
+            throw new Error('Promise was rejected with the following reason')
+        })
+
+        const elem = await browser.$('#foo')
+        elem.elementId = undefined as any
+
+        await expect(elem.click())
+            .rejects.toThrow('Can\'t call click on element with selector "#foo" because element wasn\'t found')
+    })
+
+    it('should successfully click on an element that falls stale after being re-found', async () => {
+        const elem = await browser.$('#foo')
+        const subElem = await elem.$('#subfoo')
+        const subSubElem = await subElem.$('#subsubfoo')
+        subSubElem.elementId = undefined as any
+
+        //Success returns null
+        expect(await subSubElem.click()).toEqual(null)
+        expect(vi.mocked(warn).mock.calls).toHaveLength(1)
+        expect(vi.mocked(warn).mock.calls).toEqual([['Request encountered a stale element - terminating request']])
+        // @ts-ignore mock feature
+        vi.mocked(fetch).retryCnt = 0
+    })
+
+    it('should refetch an element after a BiDi no such node error', async () => {
+        const isAfterNavigationDisplayed = vi.fn()
+            .mockRejectedValueOnce(new Error(
+                'WebDriver Bidi command "script.callFunction" failed with error: no such node - The node with the reference stale-element-123 is not known'
+            ))
+            .mockResolvedValueOnce(false)
+        browser.addCommand('isAfterNavigationDisplayed', isAfterNavigationDisplayed, { attachToElement: true })
+        const elem = await browser.$('#foo')
+
+        // @ts-expect-error undefined custom command
+        await expect(elem.isAfterNavigationDisplayed()).resolves.toBe(false)
+        expect(isAfterNavigationDisplayed).toHaveBeenCalledTimes(2)
+    })
+
+    it('should successfully getAttribute of an element that falls stale after being re-found in Safari', async () => {
+        browser = await remote({
+            baseUrl: 'http://foobar.com',
+            capabilities: {
+                browserName: 'safari',
+                // @ts-expect-error mock feature
+                keepBrowserName: true
+            },
+            waitforInterval: 20,
+            waitforTimeout: 100
+        })
+        const elem = await browser.$('#foo').getElement()
+        elem.selector = '#nonexisting'
+        // @ts-ignore mock feature
+        vi.mocked(fetch).setMockResponse([{ error: 'no such element', statusCode: 404 }, undefined, undefined, 'bar'])
+        expect(await elem.getAttribute('foo')).toEqual('bar')
+        expect(vi.mocked(waitForExist).mock.calls).toHaveLength(1)
+        vi.mocked(fetch).mockClear()
+    })
+
+    it('should successfully click on a stale element', async () => {
+        const elem = await browser.$('#foo')
+        const subElem = await elem.$('#subfoo')
+        const subSubElem = await subElem.$('#subsubfoo')
+
+        //Success returns null
+        expect(await subSubElem.click()).toEqual(null)
+        expect(vi.mocked(warn).mock.calls).toHaveLength(1)
+        expect(vi.mocked(warn).mock.calls).toEqual([['Request encountered a stale element - terminating request']])
+    })
+
+    it('re-throws the original stale error when the refetch itself fails', async () => {
+        // If the page navigated away, the refetch can fail with an unrelated
+        // error ("Index out of bounds"). That must not mask the original stale
+        // element error, which is the actionable one for the user.
+        const staleError = new Error(
+            'WebDriver Bidi command "script.callFunction" failed with error: no such node - The node with the reference stale-element-123 is not known'
+        )
+        const staleCheck = vi.fn().mockRejectedValueOnce(staleError)
+        browser.addCommand('rethrowStaleCheck', staleCheck, { attachToElement: true })
+        const elem = await browser.$('#foo')
+
+        vi.mocked(refetchElement).mockRejectedValueOnce(new Error('Index out of bounds'))
+
+        // @ts-expect-error undefined custom command
+        const error = await elem.rethrowStaleCheck().then(() => null, (e: Error) => e)
+        expect(vi.mocked(refetchElement)).toHaveBeenCalled()
+        expect(error).toBeInstanceOf(Error)
+        expect(error?.message).toContain('stale-element-123')
+        expect(error?.message).not.toContain('Index out of bounds')
+    })
+
+    it('throws a strict-mode violation from the refetch instead of the stale error', async () => {
+        const staleError = new Error('stale element reference')
+        staleError.name = 'stale element reference'
+        const staleCheck = vi.fn().mockRejectedValueOnce(staleError)
+        browser.addCommand('strictRefetchCheck', staleCheck, { attachToElement: true })
+        const elem = await browser.$('#foo')
+
+        const strictError = new StrictSelectorError('#foo', 2)
+        vi.mocked(refetchElement).mockRejectedValueOnce(strictError)
+
+        // @ts-expect-error undefined custom command
+        const error = await elem.strictRefetchCheck().then(() => null, (e: Error) => e)
+        expect(vi.mocked(refetchElement)).toHaveBeenCalled()
+        expect(error).toBe(strictError)
+    })
+
+    it('should assign elementId and w3c identifier to element scope after re-found', async () => {
+        const elem = await browser.$('#nonexisting').getElement()
+        expect(elem.elementId).toEqual(undefined)
+        expect(elem['element-6066-11e4-a52e-4f735466cecf']).toEqual(undefined)
+
+        elem.selector = '#exists'
+        elem.addCommand('getThis', function(this: any) { return this })
+        // @ts-expect-error undefined custom command
+        const elementThis = await elem.getThis()
+        expect(elementThis.elementId).toEqual('some-elem-123')
+        expect(elementThis['element-6066-11e4-a52e-4f735466cecf']).toEqual('some-elem-123')
+    })
+
+    it('should assign elementId and w3c identifier to element scope after a stale element was found again', async () => {
+        const staleError = new Error('stale element reference')
+        staleError.name = 'stale element reference'
+        const staleCheck = vi.fn().mockRejectedValueOnce(staleError).mockResolvedValueOnce('done')
+        browser.addCommand('staleOnceCheck', staleCheck, { attachToElement: true })
+        const elem = await browser.$('#foo')
+
+        const refetched = await browser.$('#foo')
+        refetched.elementId = 'some-new-elem-456'
+        vi.mocked(refetchElement).mockResolvedValueOnce(refetched)
+
+        // @ts-expect-error undefined custom command
+        expect(await elem.staleOnceCheck()).toBe('done')
+        expect(elem.elementId).toBe('some-new-elem-456')
+        expect(elem['element-6066-11e4-a52e-4f735466cecf']).toBe('some-new-elem-456')
+    })
+
+    describe('should NOT wait on element if', () => {
+        // wdio default waitForExist command
+        it('elem EXISTS and command = waitForExist', async () => {
+            const elem = await browser.$('#exists')
+            await elem.waitForExist()
+            expect(vi.mocked(waitForExist).mock.calls).toHaveLength(1)
+        })
+
+        const commands = [
+            // wdio default commands
+            'waitUntil',
+            'waitForDisplayed',
+            'waitForEnabled',
+            'isElementDisplayed',
+            'isDisplayed',
+            'isExisting',
+
+            // custom commands
+            'waitUntilFoo',
+            'waitForFoo',
+            'isExistingFoo',
+            'isDisplayedFoo']
+
+        commands.forEach(commandName => {
+            it(`elem NOT_FOUND and command = ${commandName}`, async () => {
+                browser.addCommand(commandName, () => {}, { attachToElement: true })
+                const elem = await browser.$('#nonexisting')
+                await elem[commandName]()
+                expect(vi.mocked(waitForExist).mock.calls).toHaveLength(0)
+            })
+        })
+
+        it('elem EXISTS and command = foo', async () => {
+            browser.addCommand('foo', () => {}, { attachToElement: true })
+            const elem = await browser.$('#exists')
+            // @ts-expect-error undefined custom command
+            await elem.foo()
+            expect(vi.mocked(waitForExist).mock.calls).toHaveLength(0)
+        })
+
+        it('elem EXISTS and command = isExisting', async () => {
+            const elem = await browser.$('#exists')
+            await elem.isExisting()
+            expect(vi.mocked(waitForExist).mock.calls).toHaveLength(0)
+        })
+    })
+
+    describe('should wait on element if', () => {
+        it('elem NOT_FOUND and command = foo', async () => {
+            browser.addCommand('foo', () => {}, { attachToElement: true })
+            const elem = await browser.$('#nonexisting')
+            // @ts-expect-error undefined custom command
+            await elem.foo()
+            expect(vi.mocked(waitForExist).mock.calls).toHaveLength(1)
+        })
+    })
+})
